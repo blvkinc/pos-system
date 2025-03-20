@@ -130,4 +130,12 @@ export async function removePendingTransaction(transactionId: string): Promise<v
   const state = await getSyncState();
   state.pendingTransactions = state.pendingTransactions.filter(id => id !== transactionId);
   await updateSyncState(state);
+}
+
+export async function clearProducts(): Promise<void> {
+  console.log('Clearing all products from IndexedDB...');
+  const tx = db.transaction('products', 'readwrite');
+  await tx.objectStore('products').clear();
+  await tx.done;
+  console.log('All products cleared successfully');
 } 

@@ -2,84 +2,152 @@ import { supabase, Database } from './supabase';
 import * as db from './db';
 import { Product, Transaction } from '../types';
 
-class SyncService {
-  private syncInProgress = false;
-  private maxRetries = 3;
-  private retryDelay = 5000; // 5 seconds
+export class SyncService {
+  private isOnline: boolean;
+  private isSyncing: boolean;
+  private maxRetries: number;
+  private retryDelay: number;
+  private dbState: {
+    lastSync: string | null;
+    pendingTransactions: string[];
+  };
 
   constructor() {
+    this.isOnline = navigator.onLine;
+    this.isSyncing = false;
+    this.maxRetries = 3;
+    this.retryDelay = 5000; // 5 seconds
+    this.dbState = {
+      lastSync: null,
+      pendingTransactions: []
+    };
+
     // Listen for online/offline events
-    window.addEventListener('online', () => this.handleOnline());
-    window.addEventListener('offline', () => this.handleOffline());
+    window.addEventListener('online', () => {
+      console.log('App is online');
+      this.isOnline = true;
+      this.sync();
+    });
+    
+    window.addEventListener('offline', () => {
+      console.log('App is offline');
+      this.isOnline = false;
+    });
   }
 
-  private async handleOnline() {
-    console.log('Online event detected, starting sync...');
-    const state = await db.getSyncState();
-    state.isOnline = true;
-    await db.updateSyncState(state);
-    await this.sync();
-  }
-
-  private async handleOffline() {
-    console.log('Offline event detected');
-    const state = await db.getSyncState();
-    state.isOnline = false;
-    await db.updateSyncState(state);
+  async init() {
+    try {
+      const state = await db.getSyncState();
+      if (state) {
+        this.dbState = {
+          lastSync: state.lastSync,
+          pendingTransactions: state.pendingTransactions
+        };
+      }
+    } catch (error) {
+      console.error('Failed to initialize sync service:', error);
+    }
   }
 
   async sync() {
-    if (this.syncInProgress) {
-      console.log('Sync already in progress, skipping...');
+    if (!this.isOnline || this.isSyncing) {
+      console.log(`Skipping sync: ${!this.isOnline ? 'Offline' : 'Already syncing'}`);
       return;
     }
-    console.log('Starting sync process...');
-    this.syncInProgress = true;
+
+    this.isSyncing = true;
+    console.log('Starting sync...');
 
     try {
-      // Sync products
-      await this.syncProducts();
-
-      // Sync transactions
-      await this.syncTransactions();
-
+      // Force a full product refresh
+      await this.syncProducts(true);
+      
+      await this._syncTransactions();
+      
       // Update last sync time
       const state = await db.getSyncState();
       state.lastSync = new Date().toISOString();
       await db.updateSyncState(state);
+      
       console.log('Sync completed successfully');
     } catch (error) {
       console.error('Sync failed:', error);
     } finally {
-      this.syncInProgress = false;
+      this.isSyncing = false;
     }
   }
 
-  private async syncProducts() {
+  async syncProducts(forceRefresh = false) {
     try {
-      console.log('Starting product sync...');
-      // Fetch products from Supabase
+      console.log('Syncing products...');
+      
+      // Get products from Supabase
       const { data: supabaseProducts, error } = await supabase
         .from('products')
         .select('*');
-
+      
       if (error) {
-        console.error('Error fetching products from Supabase:', error);
-        throw error;
+        throw new Error(`Failed to fetch products: ${error.message}`);
       }
-
-      console.log(`Fetched ${supabaseProducts?.length || 0} products from Supabase`);
-
-      // Save to IndexedDB
-      await db.saveProducts(supabaseProducts as Product[]);
-      console.log('Products saved to IndexedDB');
+      
+      if (!supabaseProducts || supabaseProducts.length === 0) {
+        console.log('No products found in Supabase');
+        return;
+      }
+      
+      console.log(`Fetched ${supabaseProducts.length} products from Supabase`);
+      
+      if (forceRefresh) {
+        console.log('Forcing full product refresh');
+        // Clear all existing products first
+        await db.clearProducts();
+        // Then save all new products
+        await db.saveProducts(supabaseProducts as Product[]);
+      } else {
+        // Update products individually
+        for (const product of supabaseProducts) {
+          await db.saveProduct(product);
+        }
+      }
+      
+      console.log('Products synced successfully');
     } catch (error) {
       console.error('Failed to sync products:', error);
       throw error;
     }
   }
 
-  private async syncTransactions() {
+  async syncTransactions() {
+    if (!this.isOnline) {
+      console.log('Cannot sync transactions while offline');
+      throw new Error('Cannot sync transactions while offline');
+    }
+    
+    if (this.isSyncing) {
+      console.log('Sync already in progress');
+      throw new Error('Sync already in progress');
+    }
+    
+    this.isSyncing = true;
+    
+    try {
+      await this._syncTransactions();
+      
+      // Update last sync time
+      const state = await db.getSyncState();
+      state.lastSync = new Date().toISOString();
+      await db.updateSyncState(state);
+      
+      console.log('Transaction sync completed successfully');
+    } catch (error) {
+      console.error('Transaction sync failed:', error);
+      throw error;
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  private async _syncTransactions() {
     console.log('Starting transaction sync...');
     const state = await db.getSyncState();
     const pendingTransactions = await Promise.all(
@@ -98,14 +166,49 @@ class SyncService {
         try {
           console.log(`Attempting to sync transaction ${transaction.id} (attempt ${retries + 1}/${this.maxRetries})`);
           
-          // Upload to Supabase
-          const { error } = await supabase
+          // Get the current user
+          const { data: { user } } = await supabase.auth.getUser();
+          if (!user) {
+            throw new Error('No authenticated user found');
+          }
+          
+          // Format transaction for Supabase
+          const supabaseTransaction = {
+            id: transaction.id,
+            user_id: user.id,
+            date: transaction.date,
+            subtotal: transaction.subtotal,
+            tax: transaction.tax,
+            total: transaction.total,
+            status: transaction.status
+          };
+          
+          // Upload transaction to Supabase
+          const { error: transactionError } = await supabase
             .from('transactions')
-            .insert(transaction);
+            .upsert(supabaseTransaction);
 
-          if (error) {
-            console.error(`Supabase error for transaction ${transaction.id}:`, error);
-            throw error;
+          if (transactionError) {
+            console.error(`Supabase error for transaction ${transaction.id}:`, transactionError);
+            throw transactionError;
+          }
+          
+          // Upload transaction items
+          const transactionItems = transaction.items.map(item => ({
+            transaction_id: transaction.id,
+            product_id: item.id,
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity
+          }));
+          
+          const { error: itemsError } = await supabase
+            .from('transaction_items')
+            .upsert(transactionItems);
+            
+          if (itemsError) {
+            console.error(`Supabase error for transaction items ${transaction.id}:`, itemsError);
+            throw itemsError;
           }
 
           // Remove from pending transactions
@@ -143,14 +246,50 @@ class SyncService {
     if (state.isOnline) {
       try {
         console.log(`Attempting to sync transaction ${transaction.id} immediately`);
-        // Try to sync immediately if online
-        const { error } = await supabase
+        
+        // Get the current user
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          throw new Error('No authenticated user found');
+        }
+        
+        // Format transaction for Supabase
+        const supabaseTransaction = {
+          id: transaction.id,
+          user_id: user.id,
+          date: transaction.date,
+          subtotal: transaction.subtotal,
+          tax: transaction.tax,
+          total: transaction.total,
+          status: transaction.status
+        };
+        
+        // Upload transaction to Supabase
+        const { error: transactionError } = await supabase
           .from('transactions')
-          .insert(transaction);
+          .upsert(supabaseTransaction);
 
-        if (error) {
-          console.error(`Failed to sync transaction ${transaction.id}:`, error);
-          throw error;
+        if (transactionError) {
+          console.error(`Supabase error for transaction ${transaction.id}:`, transactionError);
+          throw transactionError;
+        }
+        
+        // Upload transaction items
+        const transactionItems = transaction.items.map(item => ({
+          transaction_id: transaction.id,
+          product_id: item.id,
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity
+        }));
+        
+        const { error: itemsError } = await supabase
+          .from('transaction_items')
+          .upsert(transactionItems);
+          
+        if (itemsError) {
+          console.error(`Supabase error for transaction items ${transaction.id}:`, itemsError);
+          throw itemsError;
         }
         
         console.log(`Transaction ${transaction.id} synced successfully`);

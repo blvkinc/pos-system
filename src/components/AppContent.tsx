@@ -25,9 +25,10 @@ import { syncService } from '../lib/sync';
 import { Product, Transaction } from '../types';
 import { getProducts, saveTransaction, getTransactions } from '../lib/db';
 import { useAuth } from '../contexts/AuthContext';
+import { SyncManager } from './SyncManager';
 
 export function AppContent() {
-  const { signOut } = useAuth();
+  const { user, signOut } = useAuth();
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [cart, setCart] = useState<{ product: Product; quantity: number }[]>([]);
   const [activeTab, setActiveTab] = useState('pos');
@@ -41,40 +42,51 @@ export function AppContent() {
   const [transactionSyncStatus, setTransactionSyncStatus] = useState<Record<string, 'synced' | 'pending' | 'error'>>({});
 
   useEffect(() => {
+    if (!user) return;
+
     // Initialize database
     initDB().then(async () => {
       console.log('Database initialized');
       
-      // Initial sync
-      await syncService.sync();
-      console.log('Initial sync completed');
-      
-      // Load products and transactions
+      // Initial sync with force refresh for products
       try {
-        const [loadedProducts, loadedTransactions] = await Promise.all([
-          getProducts(),
-          getTransactions()
-        ]);
-        console.log(`Loaded ${loadedProducts.length} products and ${loadedTransactions.length} transactions`);
+        await syncService.syncProducts(true);
+        await syncService.sync();
+        console.log('Initial sync completed with forced product refresh');
         
-        setProducts(loadedProducts);
-        setTransactions(loadedTransactions);
-        
-        // Load sync status for all transactions
-        const statuses: Record<string, 'synced' | 'pending' | 'error'> = {};
-        for (const transaction of loadedTransactions) {
-          statuses[transaction.id] = await syncService.getTransactionSyncStatus(transaction.id);
-        }
-        setTransactionSyncStatus(statuses);
+        // Load products and transactions
+        try {
+          const [loadedProducts, loadedTransactions] = await Promise.all([
+            getProducts(),
+            getTransactions()
+          ]);
+          console.log(`Loaded ${loadedProducts.length} products and ${loadedTransactions.length} transactions`);
+          
+          setProducts(loadedProducts);
+          setTransactions(loadedTransactions);
+          
+          // Load sync status for all transactions
+          const statuses: Record<string, 'synced' | 'pending' | 'error'> = {};
+          for (const transaction of loadedTransactions) {
+            statuses[transaction.id] = await syncService.getTransactionSyncStatus(transaction.id);
+          }
+          setTransactionSyncStatus(statuses);
 
-        // Load last sync time
-        const lastSyncTime = await syncService.getLastSyncTime();
-        setLastSync(lastSyncTime || '');
-      } catch (error) {
-        console.error('Error loading data:', error);
+          // Load last sync time
+          const lastSyncTime = await syncService.getLastSyncTime();
+          setLastSync(lastSyncTime || '');
+        } catch (error) {
+          console.error('Error loading data:', error);
+          setNotification({
+            type: 'error',
+            message: 'Failed to load products and transactions'
+          });
+        }
+      } catch (syncError) {
+        console.error('Initial sync failed:', syncError);
         setNotification({
           type: 'error',
-          message: 'Failed to load products and transactions'
+          message: 'Failed to sync with database. Some features may not work correctly.'
         });
       }
     });
@@ -655,6 +667,11 @@ export function AppContent() {
                 <button className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">
                   Save Settings
                 </button>
+                
+                <div className="mt-8 pt-6 border-t">
+                  <h3 className="text-lg font-semibold mb-4">Database Synchronization</h3>
+                  <SyncManager />
+                </div>
               </div>
             </div>
           )}
